@@ -380,6 +380,17 @@ def apply_all_patches() -> None:
         # when the GDN modules exist).
         import ucm.integration.vllm.patch.v0300.mamba_layer_hooks_patch
 
+        # Fix: vllm-ascend's DSpark draft loader aligns the QuaRot embedding /
+        # LM head on the device; the host->device copy of the float32 rotation
+        # matrix is lowered to a TransData(groups=1), which the AICPU op store
+        # rejects on Atlas A2 (EZ3002), so every worker dies while loading the
+        # draft and the engine cannot start with method=dspark on a QuaRot
+        # checkpoint. Align on the host instead. @when_imported is
+        # self-guarding (only fires once vllm_ascend's DSpark modules are
+        # imported, i.e. never for models or speculative methods that do not
+        # use them).
+        import ucm.integration.vllm.patch.dspark_quarot_host_align_patch
+
         logger.info("UCM patch initialization completed!")
 
     except Exception as e:
