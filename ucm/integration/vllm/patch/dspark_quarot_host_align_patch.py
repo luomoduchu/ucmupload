@@ -41,8 +41,22 @@ Semantics are unchanged: ``target_shard.float() @ rotation.float().T`` truncated
 to the shard rows, tail rows zeroed. The fp32 intermediates stay in host memory,
 so the full-vocabulary product no longer has to fit in device memory either.
 
-This module only registers import hooks, so it is inert until
-``vllm_ascend``'s DSpark / DFlash modules are imported.
+Three layers, so that no QuaRot weight path keeps the broken transfer:
+
+1. ``load_quarot_target_layer`` — replaced (chunked host alignment).
+2. ``align_draft_weights`` — replaced (host rotate + ``copy_`` write-back),
+   rebound on every draft module that imported it by name.
+3. ``process_weight`` — replaced so that a *device* input also rotates on the
+   host and returns through ``copy_`` instead of a device-side transfer, plus
+   ``safe_tensor_to``: a size-gated net on ``Tensor.to`` / ``Tensor.npu`` that
+   routes any remaining CPU->NPU move of a large tensor through
+   ``empty(...) + copy_`` (that is the op pair the A2 op store does support).
+   The net covers sites this module does not know by name (other model families,
+   quant post-processing, future upstream code); disable it with
+   ``UCM_QUAROT_SAFE_TO=0``.
+
+This module only registers import hooks (and the ``Tensor.to`` net), so it is
+inert until ``vllm_ascend``'s model modules are imported.
 """
 
 from __future__ import annotations
@@ -58,6 +72,12 @@ logger = init_logger(__name__)
 # Rows per host-side MatMul/copy step; bounds the fp32 temporary for a full
 # vocabulary shard without making the alignment slow.
 _ALIGN_CHUNK_ROWS = 4096
+
+# `safe_tensor_to` only re-routes host->device moves at least this large. The
+# broken TransData shows up for weight/rotation matrices (16M elements and up);
+# small per-step transfers (ids, masks, quant scales) keep the stock path, and
+# so does everything on device already.
+_SAFE_TO_MIN_NUMEL = 1 << 20
 
 # ``qwen3_dspark`` does ``from ...llama_eagle3 import load_quarot_target_layer``
 # and the DFlash/Kimi/GLM drafts do ``from ...qwen3_dspark import
@@ -78,6 +98,9 @@ _DSPARK_MODULE = "vllm_ascend.models.qwen3_dspark"
 
 _loader_wrapper = None
 _align_wrapper = None
+_process_weight_wrapper = None
+_safe_to_installed = False
+_safe_to_logged = False
 
 _TARGET_EMBED_WEIGHT_NAMES = (
     "language_model.model.embed_tokens.weight",
@@ -153,6 +176,47 @@ def _build_loader_wrapper(module):
     return load_quarot_target_layer
 
 
+def _build_process_weight_wrapper(module):
+    """Make ``process_weight`` rotate on the host whatever it is handed.
+
+    Upstream does ``rotation.to(device=linear_weight.device)`` first, so a
+    device input transfers the rotation matrix. Keep that contract (return a
+    tensor on the caller's device) but do the math in host memory and hand the
+    result back through ``empty(...) + copy_``.
+    """
+    import torch
+
+    original = getattr(module, "process_weight", None)
+    if not callable(original):
+        logger.warning(
+            "UCM QuaRot host alignment skipped: %s exposes no process_weight",
+            module.__name__,
+        )
+        return None
+
+    @wraps(original)
+    def process_weight(linear_weight, rotation_weight):
+        if linear_weight.device.type == "cpu":
+            return original(linear_weight, rotation_weight)
+        host = linear_weight.cpu()
+        if rotation_weight.device.type != "cpu":
+            rotation_weight = rotation_weight.cpu()
+        aligned = original(host, rotation_weight)
+        out = torch.empty(
+            aligned.shape, dtype=aligned.dtype, device=linear_weight.device
+        )
+        out.copy_(aligned)
+        logger.info(
+            "UCM QuaRot host alignment: rotated %s weight %s",
+            linear_weight.device,
+            tuple(linear_weight.shape),
+        )
+        return out
+
+    process_weight._ucm_quarot_host_align = True
+    return process_weight
+
+
 def _build_align_wrapper(module):
     """Build the host-side replacement for ``align_draft_weights``.
 
@@ -187,7 +251,7 @@ def _build_align_wrapper(module):
     def _rotate_projection(weight, rotation):
         # ``.to(weight.device)`` on the fp32 product is the op that fails on A2;
         # rotate in host memory and write back with a same-dtype copy instead.
-        aligned = process_weight(weight.cpu(), rotation)
+        aligned = module.process_weight(weight.cpu(), rotation)
         weight.data.copy_(aligned)
         logger.info(
             "UCM QuaRot host alignment: rotated draft projection %s",
@@ -255,7 +319,7 @@ def _sweep_aliases():
 
 
 def _install(module, quiet=False):
-    global _loader_wrapper, _align_wrapper
+    global _loader_wrapper, _align_wrapper, _process_weight_wrapper
     changed = []
 
     loader = getattr(module, "load_quarot_target_layer", None)
@@ -269,6 +333,16 @@ def _install(module, quiet=False):
         if _loader_wrapper is not None:
             module.load_quarot_target_layer = _loader_wrapper
             changed.append("load_quarot_target_layer")
+
+    process_weight = getattr(module, "process_weight", None)
+    if process_weight is not None and not getattr(
+        process_weight, "_ucm_quarot_host_align", False
+    ):
+        if _process_weight_wrapper is None:
+            _process_weight_wrapper = _build_process_weight_wrapper(module)
+        if _process_weight_wrapper is not None:
+            module.process_weight = _process_weight_wrapper
+            changed.append("process_weight")
 
     align = getattr(module, "align_draft_weights", None)
     if align is not None and not getattr(align, "_ucm_quarot_host_align", False):
@@ -287,6 +361,146 @@ def _install(module, quiet=False):
             ", ".join(changed),
         )
     return bool(changed)
+
+
+def _parse_to_target(args, kwargs):
+    """Resolve the destination device/dtype of a ``Tensor.to`` call."""
+    import torch
+
+    torch_device = getattr(torch, "device", None)
+    torch_dtype = getattr(torch, "dtype", None)
+    device = kwargs.get("device")
+    dtype = kwargs.get("dtype")
+    non_blocking = bool(kwargs.get("non_blocking", False))
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            device, dtype = arg.device, dtype or arg.dtype
+        elif torch_device is not None and isinstance(arg, torch_device):
+            device = arg
+        elif isinstance(arg, str):
+            if arg.split(":")[0] in ("cpu", "npu", "cuda", "xpu", "meta"):
+                device = torch.device(arg) if torch_device is not None else arg
+            else:
+                dtype = getattr(torch, arg, dtype)
+        elif torch_dtype is not None and isinstance(arg, torch_dtype):
+            dtype = arg
+    return device, dtype, non_blocking
+
+
+def _is_host_weight(tensor):
+    """True for a host tensor big enough to hit the A2 TransData defect.
+
+    Parameters (``requires_grad``) keep the stock path so that module placement
+    (``nn.Module.to``/``_apply``) is untouched; small transfers (ids, masks,
+    quant scales below the threshold) are left alone too.
+    """
+    try:
+        return (
+            tensor.device.type == "cpu"
+            and tensor.numel() >= _SAFE_TO_MIN_NUMEL
+            and not getattr(tensor, "requires_grad", False)
+        )
+    except Exception:
+        return False
+
+
+def _install_safe_to():
+    """Route large CPU->NPU ``Tensor.to``/``npu()`` moves through ``copy_``.
+
+    This is the backstop for QuaRot sites this module does not know by name
+    (other model families, quant post-processing, future upstream code): the
+    transfer keeps identical semantics, only the op pair changes to the one
+    the A2 op store supports.
+    """
+    global _safe_to_installed, _SAFE_TO_MIN_NUMEL
+    if _safe_to_installed:
+        return
+    import functools
+    import os
+
+    import torch
+
+    if os.environ.get("UCM_QUAROT_SAFE_TO", "1").lower() in (
+        "0",
+        "false",
+        "off",
+        "no",
+    ):
+        logger.info("UCM QuaRot safe Tensor.to disabled (UCM_QUAROT_SAFE_TO)")
+        _safe_to_installed = True
+        return
+
+    override = os.environ.get("UCM_QUAROT_SAFE_TO_MIN_NUMEL")
+    if override:
+        try:
+            _SAFE_TO_MIN_NUMEL = int(override)
+        except ValueError:
+            logger.warning(
+                "UCM QuaRot safe Tensor.to: ignoring bad "
+                "UCM_QUAROT_SAFE_TO_MIN_NUMEL=%r",
+                override,
+            )
+
+    orig_to = torch.Tensor.to
+    if not getattr(orig_to, "_ucm_quarot_safe_to", False):
+
+        @functools.wraps(orig_to)
+        def to(self, *args, **kwargs):
+            try:
+                if _is_host_weight(self):
+                    device, dtype, non_blocking = _parse_to_target(args, kwargs)
+                    if device is not None and device.type != "cpu":
+                        host = self if dtype is None or dtype == self.dtype else self.to(dtype)
+                        out = torch.empty(host.shape, dtype=host.dtype, device=device)
+                        out.copy_(host, non_blocking=non_blocking)
+                        _log_safe_to(self, device)
+                        return out
+            except Exception:  # fall through to the stock implementation
+                pass
+            return orig_to(self, *args, **kwargs)
+
+        to._ucm_quarot_safe_to = True
+        torch.Tensor.to = to
+
+    orig_npu = getattr(torch.Tensor, "npu", None)
+    if orig_npu is not None and not getattr(orig_npu, "_ucm_quarot_safe_to", False):
+
+        @functools.wraps(orig_npu)
+        def npu(self, *args, **kwargs):
+            try:
+                if _is_host_weight(self):
+                    device = args[0] if args else "npu"
+                    out = torch.empty(self.shape, dtype=self.dtype, device=device)
+                    out.copy_(self)
+                    _log_safe_to(self, device)
+                    return out
+            except Exception:  # fall through to the stock implementation
+                pass
+            return orig_npu(self, *args, **kwargs)
+
+        npu._ucm_quarot_safe_to = True
+        torch.Tensor.npu = npu
+
+    _safe_to_installed = True
+    logger.info(
+        "UCM QuaRot safe Tensor.to installed (>= %d elements, kill switch "
+        "UCM_QUAROT_SAFE_TO=0, threshold override "
+        "UCM_QUAROT_SAFE_TO_MIN_NUMEL)",
+        _SAFE_TO_MIN_NUMEL,
+    )
+
+
+def _log_safe_to(tensor, device):
+    global _safe_to_logged
+    if _safe_to_logged:
+        return
+    _safe_to_logged = True
+    logger.info(
+        "UCM QuaRot safe Tensor.to: routed a %s %s transfer to %s through copy_",
+        tuple(tensor.shape),
+        tensor.dtype,
+        device,
+    )
 
 
 def _make_hook():
@@ -308,3 +522,11 @@ _HOOK = _make_hook()
 
 for _module_name in _PATCHED_MODULES:
     when_imported(_module_name)(_HOOK)
+
+# Installed eagerly: `apply_all_patches()` runs right after `import vllm`, i.e.
+# before any model or draft is constructed, and the net must cover paths whose
+# module names this patch does not know.
+try:
+    _install_safe_to()
+except Exception as e:  # never break startup because of the backstop
+    logger.error("UCM QuaRot safe Tensor.to install failed: %s", e)
