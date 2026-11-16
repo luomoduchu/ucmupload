@@ -76,6 +76,13 @@ def main() -> int:
             raise AssertionError(f"{mod.__name__}.load_quarot_target_layer is NOT patched")
         print(f"  ok  {mod.__name__}.load_quarot_target_layer -> host alignment")
 
+    if not getattr(qwen3_dspark.align_draft_weights, "_ucm_quarot_host_align", False):
+        raise AssertionError(
+            "vllm_ascend.models.qwen3_dspark.align_draft_weights is NOT patched "
+            "(projection rotation would still go through Tensor.to(device))"
+        )
+    print("  ok  vllm_ascend.models.qwen3_dspark.align_draft_weights -> host alignment")
+
     ucm_patch._ALIGN_CHUNK_ROWS = 2  # force several loop iterations
 
     torch.manual_seed(0)
