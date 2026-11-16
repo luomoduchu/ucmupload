@@ -197,6 +197,7 @@ find ucm -name '__pycache__' -prune -exec rm -rf {} +
 | v1 | `c05a40b` | 只修 `llama_eagle3.load_quarot_target_layer`（`llama_eagle3.py:86/90`） |
 | v2 | `5646fc7` | + 替换 `align_draft_weights`（`qwen3_dspark.py:48`），并 hook `quarot_utils` |
 | v3 | `b75e72b` | + 替换 `process_weight`，+ `safe_tensor_to` 兜底网；按审计结果覆盖 §3 表中全部路径 |
+| v4 | `4a1a58c` | 现场复现后修正写回方式：不再直接写活的参数，改为"新鲜 ND 缓冲区 + 分块拷贝 + 重新施加 NZ 布局" |
 
 ## 10. 本目录内容
 
@@ -206,4 +207,43 @@ find ucm -name '__pycache__' -prune -exec rm -rf {} +
 | `dspark_quarot_host_align_patch.py` | 新增的 UCM patch 模块（v3） |
 | `0001-add-dspark-quarot-host-align.patch` | 对 develop@6e3dbaa 的增量 patch（新文件 + 注册行） |
 | `verify_ucm_patch.py` | 机器上的运行时校验脚本 |
+| `probe_a2_h2d.py` | 单卡探测脚本：判断 EZ3002 到底由"目标布局（FRACTAL_NZ）"还是"传输尺寸"触发 |
 | `SHA256SUMS.txt` | 校验和 |
+
+## 11. v4：为什么 v3 还炸，改了什么
+
+现场日志（`qwen3_dspark.py:101 → align_draft_weights → _rotate_projection → weight.data.copy_(aligned)`）
+
+```
+RuntimeError: operator(): OpParamMaker.cpp:400 OPS function error: Identity, error code is 500002
+Optype [TransData] of Ops kernel [DNN_VM_HOST_CPU_OP_STORE] ... groups should be greater than 1, but now is 1
+Optype [TransData] of Ops kernel [aicpu_ascend_kernel]   ... groups should be greater than 1, but now is 1
+No supported Ops kernel and engine are found for [trans_TransData_0]
+```
+
+说明我 v1–v3 的一个前提错了：**"`copy_` 一定安全"不成立**。同一次启动里 draft 自己的 `fc.weight`
+是能被正常加载进去的，差别在**目标张量的状态**——`process_weights_after_loading` 之后，bf16 权重
+可能已经被 `maybe_trans_nz` 转成 FRACTAL_NZ（`additional_config.weight_nz_mode`），此后任何
+"host ND → device NZ" 的拷贝都会被 lower 成那个 groups=1 的 TransData。
+
+v4 的写回流程改成和"正常加载 + 后处理"完全一致的顺序：
+
+1. host 上算好旋转结果（dtype 已对齐）；
+2. `torch.empty(...)` 造一个**全新的 ND** device 张量；
+3. 按 8 MiB 分块 `copy_` 进去（避免单个大传输）；
+4. 用 `maybe_trans_nz` 重新施加该层需要的布局（ND 时是 no-op，所以不会二次量化）；
+5. `weight.data = 新的张量`。
+
+日志会打印 `acl format before -> after` 与 `nz_mode`，例如：
+
+```
+UCM QuaRot host alignment: rotated draft projection (4096, 4096) (acl format 29 -> 29, nz_mode=2)
+```
+
+- `format ? -> ?`：拿不到 ACL 格式（正常，非 A2 或 torch_npu 无该接口）；
+- `29 -> 29`：目标原本就是 NZ，现在按 NZ 写回，正是修复点；
+- `0 -> 29` / `0 -> 0`：原本是 ND，按层策略决定是否转 NZ。
+
+若 v4 仍失败，请跑 `probe_a2_h2d.py`（单卡即可）并把输出发回来，它会直接指出是"大张量传输"
+还是"NZ 布局"的问题。
+

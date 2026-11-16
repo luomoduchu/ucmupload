@@ -111,6 +111,79 @@ _TARGET_LM_HEAD_WEIGHT_NAMES = (
     "lm_head.weight",
 )
 
+# Host->device writes are issued in blocks of at most this many bytes. The A2
+# op store rejects the single-op model it builds for one huge ND->NZ TransData
+# (`EZ3002 ... groups should be greater than 1`), so keep every transfer small
+# enough that it is a plain memcpy, and anchor it to a fresh ND tensor.
+_COPY_CHUNK_BYTES = 8 << 20
+_COPY_SYNC_EVERY_CHUNK = False
+
+
+def _npu_format(tensor):
+    """Return the ACL format of a device tensor, or None when unavailable."""
+    try:
+        import torch_npu
+
+        return torch_npu.get_npu_format(tensor)
+    except Exception:
+        return None
+
+
+def _weight_nz_mode():
+    """Return ``additional_config.weight_nz_mode`` (0/1/2) or None."""
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return int(get_ascend_config().weight_nz_mode)
+    except Exception:
+        return None
+
+
+def _apply_weight_layout(tensor):
+    """Re-apply the layout the layer expects (FRACTAL_NZ when configured).
+
+    Mirrors what ``process_weights_after_loading`` does to a freshly loaded
+    weight. ``maybe_trans_nz`` is a no-op for dtypes/layers that stay in ND, so
+    this is idempotent and never double-quantizes.
+    """
+    try:
+        from vllm_ascend.utils import maybe_trans_nz
+    except Exception:
+        return tensor
+    try:
+        return maybe_trans_nz(tensor)
+    except Exception as e:
+        logger.warning("UCM QuaRot host alignment: layout cast failed: %s", e)
+        return tensor
+
+
+def _chunk_rows(width, element_size):
+    """Rows per host->device block, sized from ``_COPY_CHUNK_BYTES``."""
+    row_bytes = max(1, int(width) * max(1, int(element_size)))
+    return max(1, _COPY_CHUNK_BYTES // row_bytes)
+
+
+def _write_host_block(dst, src):
+    """Copy a host tensor into a device tensor in small blocks.
+
+    Returns True when ``dst`` is the destination that was written.
+    """
+    import torch
+
+    if src.shape != dst.shape:
+        dst.copy_(src)
+        return True
+    rows = _chunk_rows(dst.shape[-1], dst.element_size())
+    if dst.ndim < 2 or dst.shape[0] <= rows:
+        dst.copy_(src)
+        return True
+    for start in range(0, dst.shape[0], rows):
+        stop = min(start + rows, dst.shape[0])
+        dst[start:stop].copy_(src[start:stop])
+        if _COPY_SYNC_EVERY_CHUNK and torch.npu.is_available():
+            torch.npu.synchronize()
+    return True
+
 
 def _build_loader_wrapper(module):
     """Build the host-side replacement for ``load_quarot_target_layer``."""
@@ -156,8 +229,15 @@ def _build_loader_wrapper(module):
 
         loaded_rows = target_weight.shape[0]
         dtype = layer.weight.dtype
-        for start in range(0, loaded_rows, _ALIGN_CHUNK_ROWS):
-            stop = min(start + _ALIGN_CHUNK_ROWS, loaded_rows)
+        rows = max(
+            1,
+            min(
+                _ALIGN_CHUNK_ROWS,
+                _chunk_rows(layer.weight.shape[1], layer.weight.element_size()),
+            ),
+        )
+        for start in range(0, loaded_rows, rows):
+            stop = min(start + rows, loaded_rows)
             block = target_weight[start:stop]
             if rotation_t is not None:
                 block = torch.matmul(block, rotation_t)
@@ -205,7 +285,7 @@ def _build_process_weight_wrapper(module):
         out = torch.empty(
             aligned.shape, dtype=aligned.dtype, device=linear_weight.device
         )
-        out.copy_(aligned)
+        _write_host_block(out, aligned)
         logger.info(
             "UCM QuaRot host alignment: rotated %s weight %s",
             linear_weight.device,
@@ -248,14 +328,33 @@ def _build_align_wrapper(module):
         module, "TARGET_LM_HEAD_WEIGHT_NAMES", _TARGET_LM_HEAD_WEIGHT_NAMES
     )
 
-    def _rotate_projection(weight, rotation):
-        # ``.to(weight.device)`` on the fp32 product is the op that fails on A2;
-        # rotate in host memory and write back with a same-dtype copy instead.
+    def _rotate_projection(projection, rotation):
+        # Writing into the live parameter directly is what fails on A2: after
+        # `process_weights_after_loading` the weight may already be
+        # FRACTAL_NZ (weight_nz_mode), and an ND host->NZ device copy lowers to
+        # a TransData whose `groups` is 1, which the AICPU op store rejects.
+        # So rotate in host memory, land the result in a *fresh ND* buffer in
+        # small blocks, then re-apply the layout the layer expects - exactly the
+        # sequence a normal load followed by `process_weights_after_loading`
+        # performs.
+        weight = projection.weight
         aligned = module.process_weight(weight.cpu(), rotation)
-        weight.data.copy_(aligned)
+        target = weight.data
+        format_before = _npu_format(target)
+        fresh = torch.empty(target.shape, dtype=target.dtype, device=target.device)
+        _write_host_block(fresh, aligned)
+        if getattr(projection, "skip_weight_nz_conversion", False):
+            pass
+        else:
+            fresh = _apply_weight_layout(fresh)
+        weight.data = fresh
         logger.info(
-            "UCM QuaRot host alignment: rotated draft projection %s",
+            "UCM QuaRot host alignment: rotated draft projection %s "
+            "(acl format %s -> %s, nz_mode=%s)",
             tuple(weight.shape),
+            format_before,
+            _npu_format(fresh),
+            _weight_nz_mode(),
         )
 
     @wraps(original)
@@ -266,7 +365,7 @@ def _build_align_wrapper(module):
         rotation_path = get_rotation_path(vllm_config)
         if rotation_path is not None:
             rotation = get_rotation_matrix(rotation_path).cpu()
-            _rotate_projection(projection.weight, rotation)
+            _rotate_projection(projection, rotation)
         else:
             if get_pp_group().world_size == 1:
                 return
@@ -452,7 +551,7 @@ def _install_safe_to():
                     if device is not None and device.type != "cpu":
                         host = self if dtype is None or dtype == self.dtype else self.to(dtype)
                         out = torch.empty(host.shape, dtype=host.dtype, device=device)
-                        out.copy_(host, non_blocking=non_blocking)
+                        _write_host_block(out, host)
                         _log_safe_to(self, device)
                         return out
             except Exception:  # fall through to the stock implementation
@@ -471,7 +570,7 @@ def _install_safe_to():
                 if _is_host_weight(self):
                     device = args[0] if args else "npu"
                     out = torch.empty(self.shape, dtype=self.dtype, device=device)
-                    out.copy_(self)
+                    _write_host_block(out, self)
                     _log_safe_to(self, device)
                     return out
             except Exception:  # fall through to the stock implementation
