@@ -3,7 +3,7 @@
 本目录是**已打好补丁的 UCM develop 源码**，用于在「不能改 vllm_ascend 镜像、只能从 UCM 打 patch」
 的机器上修复下面这个启动失败。
 
-- 上游基线：`ModelEngine-Group/unified-cache-management` @ `develop` / `6e3dbaa`（2026-11-16）
+- 上游基线：`ModelEngine-Group/unified-cache-management` @ `develop` / `1771cfc`（2026-11-17）
 - 打包提交：`c05a40b`(v1) → `5646fc7`(v2) → `b75e72b`(v3)
 - 适用环境：vLLM 0.32.0 + vllm-ascend 0.32.0rc1、Atlas A2（910B）、MiniMax-M3.1-Flash-w8a8 + `method=dspark`
 
@@ -114,7 +114,7 @@ site-packages 的 `ucm_patch.pth` 在解释器启动时装一个 meta-path finde
 ### 方式 A：整包替换
 
 ```bash
-tar xzf unified-cache-management-develop-6e3dbaa-dspark.tar.gz -C /
+tar xzf unified-cache-management-develop-1771cfc-dspark.tar.gz -C /
 python -c "import ucm, os; print(os.path.dirname(ucm.__file__))"   # 确认目标目录
 rsync -a --delete unified-cache-management-develop/ <上面打印的父目录>/
 find <上面打印的父目录> -name '__pycache__' -prune -exec rm -rf {} +
@@ -125,7 +125,7 @@ find <上面打印的父目录> -name '__pycache__' -prune -exec rm -rf {} +
 ```bash
 cd <UCM 根目录>
 cp dspark_quarot_host_align_patch.py ucm/integration/vllm/patch/
-git apply -p1 0001-add-dspark-quarot-host-align.patch     # 已校验可对 develop@6e3dbaa 干净应用
+git apply -p1 0001-add-dspark-quarot-host-align.patch     # 已校验可对 develop@1771cfc 干净应用
 python -c "import py_compile;py_compile.compile('ucm/integration/vllm/patch/dspark_quarot_host_align_patch.py',doraise=True);py_compile.compile('ucm/integration/vllm/patch/apply_patch.py',doraise=True);print('compile ok')"
 find ucm -name '__pycache__' -prune -exec rm -rf {} +
 ```
@@ -198,14 +198,15 @@ find ucm -name '__pycache__' -prune -exec rm -rf {} +
 | v2 | `5646fc7` | + 替换 `align_draft_weights`（`qwen3_dspark.py:48`），并 hook `quarot_utils` |
 | v3 | `b75e72b` | + 替换 `process_weight`，+ `safe_tensor_to` 兜底网；按审计结果覆盖 §3 表中全部路径 |
 | v4 | `4a1a58c` | 现场复现后修正写回方式：不再直接写活的参数，改为"新鲜 ND 缓冲区 + 分块拷贝 + 重新施加 NZ 布局" |
+| v5 | `a37d56f` | 探测证明写入方向正常，补上读回方向：读 weight.cpu() 前显式做 NZ→ND cast，避免 D2H 的格式转换 |
 
 ## 10. 本目录内容
 
 | 文件 | 说明 |
 | --- | --- |
-| `unified-cache-management-develop-6e3dbaa-dspark.tar.gz` | 打好补丁（v3）的完整 UCM develop 源码（git archive，不含 .git） |
+| `unified-cache-management-develop-1771cfc-dspark.tar.gz` | 打好补丁（v5）的完整 UCM develop 源码（git archive，不含 .git） |
 | `dspark_quarot_host_align_patch.py` | 新增的 UCM patch 模块（v3） |
-| `0001-add-dspark-quarot-host-align.patch` | 对 develop@6e3dbaa 的增量 patch（新文件 + 注册行） |
+| `0001-add-dspark-quarot-host-align.patch` | 对 develop@1771cfc 的增量 patch（新文件 + 注册行） |
 | `verify_ucm_patch.py` | 机器上的运行时校验脚本 |
 | `probe_a2_h2d.py` | 单卡探测脚本：判断 EZ3002 到底由"目标布局（FRACTAL_NZ）"还是"传输尺寸"触发 |
 | `SHA256SUMS.txt` | 校验和 |
