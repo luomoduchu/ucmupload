@@ -129,6 +129,54 @@ def main():
         nd = torch_npu.npu_format_cast(nz, ACL_FORMAT_FRACTAL_ND)
         return f"nz={_fmt(nz)} -> nd={_fmt(nd)}"
 
+    def nz_values_ok():
+        dst = torch.empty(SHAPE, dtype=torch.bfloat16, device=DEV)
+        dst.copy_(host_bf16)
+        nz = torch_npu.npu_format_cast(dst, ACL_FORMAT_FRACTAL_NZ)
+        nz.copy_(host_bf16)
+        same = torch.equal(nz.cpu(), host_bf16)
+        return f"format={_fmt(nz)} values_equal={same}"
+
+    def nz_to_cpu():
+        # `weight.cpu()` on a weight that is already FRACTAL_NZ: the read-back
+        # needs NZ -> ND on the way to host memory.
+        dst = torch.empty(SHAPE, dtype=torch.bfloat16, device=DEV)
+        dst.copy_(host_bf16)
+        nz = torch_npu.npu_format_cast(dst, ACL_FORMAT_FRACTAL_NZ)
+        out = nz.cpu()
+        return f"nz={_fmt(nz)} -> host dtype={out.dtype} equal={torch.equal(out, host_bf16)}"
+
+    def nz_cpu_roundtrip():
+        dst = torch.empty(SHAPE, dtype=torch.bfloat16, device=DEV)
+        dst.copy_(host_bf16)
+        nz = torch_npu.npu_format_cast(dst, ACL_FORMAT_FRACTAL_NZ)
+        back = nz.cpu().to(DEV)
+        return f"format={_fmt(back)} equal={torch.equal(back.cpu(), host_bf16)}"
+
+    def nz_int8():
+        # A quantized projection: bf16 host -> int8 FRACTAL_NZ destination.
+        dst = torch.empty(SHAPE, dtype=torch.int8, device=DEV)
+        nz = torch_npu.npu_format_cast(dst, ACL_FORMAT_FRACTAL_NZ)
+        nz.copy_(host_bf16)
+        return f"format={_fmt(nz)}"
+
+    def nz_fp32():
+        dst = torch.empty(SHAPE, dtype=torch.float32, device=DEV)
+        dst.copy_(host_fp32)
+        nz = torch_npu.npu_format_cast(dst, ACL_FORMAT_FRACTAL_NZ)
+        nz.copy_(host_fp32)
+        return f"format={_fmt(nz)}"
+
+    def nz_big():
+        shape = (8192, 8192)  # 134 MiB, well past the 32 MiB probe above
+        big = torch.randn(*shape, dtype=torch.bfloat16)
+        dst = torch.empty(shape, dtype=torch.bfloat16, device=DEV)
+        dst.copy_(big)
+        nz = torch_npu.npu_format_cast(dst, ACL_FORMAT_FRACTAL_NZ)
+        nz.copy_(big)
+        out = nz.cpu()
+        return f"format={_fmt(nz)} equal={torch.equal(out, big)}"
+
     print()
     probe("A. copy_ bf16 host -> fresh ND bf16 device tensor", nd_bf16)
     probe("B. copy_ fp32 host -> fresh ND bf16 device tensor", nd_fp32_source)
@@ -138,22 +186,28 @@ def main():
     probe("F. copy_ bf16 host -> FRACTAL_NZ device tensor (whole)", nz_dst)
     probe("G. copy_ bf16 host -> FRACTAL_NZ device tensor (256 rows)", nz_dst_chunked)
     probe("H. FRACTAL_NZ -> ND cast", nz_back_to_nd)
+    probe("I. bf16 host -> FRACTAL_NZ, then read back and compare", nz_values_ok)
+    probe("J. FRACTAL_NZ .cpu() read-back (what weight.cpu() does)", nz_to_cpu)
+    probe("K. FRACTAL_NZ -> host -> device round trip", nz_cpu_roundtrip)
+    probe("L. bf16 host -> int8 FRACTAL_NZ destination", nz_int8)
+    probe("M. fp32 host -> fp32 FRACTAL_NZ destination", nz_fp32)
+    probe("N. 8192x8192 bf16 -> FRACTAL_NZ, whole, then read back", nz_big)
 
     print()
     print(
         "Reading the result:\n"
-        "  F/G report format=29 (FRACTAL_NZ)?\n"
-        "    yes, and F fails  -> the destination layout is the trigger; the fix\n"
-        "                         is to write into a fresh ND tensor and let the\n"
-        "                         layer's post-load hook re-apply NZ.\n"
-        "    yes, only G works -> NZ is fine for small blocks; chunked writes fix it.\n"
-        "    no (format=2)     -> internal formats are still disabled; the run is\n"
-        "                         not representative, do not trust F/G/H.\n"
-        "  A-E fail           -> the box rejects large 2-D host->device transfers\n"
-        "                        in general; only small/chunked copies are safe.\n"
-        "  everything ok      -> the failure needs the real model context: print\n"
-        "                        torch_npu.get_npu_format(layer.weight.data) right\n"
-        "                        before the failing copy."
+        "  J/K fail           -> the read-back of an NZ weight (weight.cpu()) is the\n"
+        "                        failing op; the copy direction to fix is device->host,\n"
+        "                        not host->device.\n"
+        "  L fails            -> dtype conversion into NZ (bf16 host -> int8 NZ) is the\n"
+        "                        trigger, i.e. the draft projection is quantized.\n"
+        "  N fails            -> NZ copies only work up to some size; chunk harder.\n"
+        "  F fails            -> the destination layout is the trigger; write into a\n"
+        "                        fresh ND tensor and let the post-load hook re-apply NZ.\n"
+        "  A-E fail           -> the box rejects large 2-D host->device transfers in\n"
+        "                        general; only small/chunked copies are safe.\n"
+        "  all ok             -> the failure needs the real model context: the v4 patch\n"
+        "                        logs the acl format and nz_mode right before the write."
     )
 
 
