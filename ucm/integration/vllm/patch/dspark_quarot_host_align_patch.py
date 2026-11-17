@@ -115,6 +115,7 @@ _TARGET_LM_HEAD_WEIGHT_NAMES = (
 # op store rejects the single-op model it builds for one huge ND->NZ TransData
 # (`EZ3002 ... groups should be greater than 1`), so keep every transfer small
 # enough that it is a plain memcpy, and anchor it to a fresh ND tensor.
+_ACL_FORMAT_FRACTAL_ND = 2
 _COPY_CHUNK_BYTES = 8 << 20
 _COPY_SYNC_EVERY_CHUNK = False
 
@@ -127,6 +128,39 @@ def _npu_format(tensor):
         return torch_npu.get_npu_format(tensor)
     except Exception:
         return None
+
+
+def _to_host(tensor):
+    """Read a device tensor back to host without an implicit format cast.
+
+    ``Tensor.cpu()`` of a FRACTAL_NZ weight asks GE for a device->host format
+    conversion, which is exactly the node that fails on A2. Do the NZ->ND cast
+    explicitly first (a supported AICore op), so the read-back itself is a plain
+    D2H memcpy.
+    """
+    fmt = _npu_format(tensor)
+    try:
+        fmt_id = None if fmt is None else int(fmt)
+    except Exception:
+        fmt_id = None
+    if fmt_id is not None and fmt_id != _ACL_FORMAT_FRACTAL_ND:
+        try:
+            import torch_npu
+
+            tensor = torch_npu.npu_format_cast(tensor, _ACL_FORMAT_FRACTAL_ND)
+            logger.info(
+                "UCM QuaRot host alignment: cast %s from acl format %s to ND "
+                "before reading it back",
+                tuple(tensor.shape),
+                fmt,
+            )
+        except Exception as e:
+            logger.warning(
+                "UCM QuaRot host alignment: explicit ND cast failed (%s); "
+                "falling back to Tensor.cpu()",
+                e,
+            )
+    return tensor.cpu()
 
 
 def _weight_nz_mode():
@@ -278,7 +312,7 @@ def _build_process_weight_wrapper(module):
     def process_weight(linear_weight, rotation_weight):
         if linear_weight.device.type == "cpu":
             return original(linear_weight, rotation_weight)
-        host = linear_weight.cpu()
+        host = _to_host(linear_weight)
         if rotation_weight.device.type != "cpu":
             rotation_weight = rotation_weight.cpu()
         aligned = original(host, rotation_weight)
@@ -338,7 +372,7 @@ def _build_align_wrapper(module):
         # sequence a normal load followed by `process_weights_after_loading`
         # performs.
         weight = projection.weight
-        aligned = module.process_weight(weight.cpu(), rotation)
+        aligned = module.process_weight(_to_host(weight.data), rotation)
         target = weight.data
         format_before = _npu_format(target)
         fresh = torch.empty(target.shape, dtype=target.dtype, device=target.device)
